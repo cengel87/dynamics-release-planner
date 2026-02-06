@@ -8,7 +8,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
+# ────────────────────────────────────────────────
+# CONFIG
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
@@ -22,6 +25,40 @@ HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
+# RELEASE WAVE REFERENCE (FOR DISPLAY ONLY)
+# ────────────────────────────────────────────────
+# These dates are for reference and display purposes only.
+# They represent the typical wave periods as published by Microsoft.
+# Individual features may GA at different times within or outside these ranges.
+# Source: Microsoft Dynamics 365 Release Schedule documentation
+
+RELEASE_WAVES = {
+    "2024 release wave 1": {"start": "2024-04-01", "end": "2024-09-30"},
+    "2024 release wave 2": {"start": "2024-10-01", "end": "2025-03-31"},
+    "2025 release wave 1": {"start": "2025-04-01", "end": "2025-09-30"},
+    "2025 release wave 2": {"start": "2025-10-01", "end": "2026-03-31"},
+    "2026 release wave 1": {"start": "2026-04-01", "end": "2026-09-30"},
+    "2026 release wave 2": {"start": "2026-10-01", "end": "2027-03-31"},
+}
+
+def get_wave_end_date(wave_name):
+    """
+    Get the end date for a release wave period (for reference only).
+    NOTE: This does NOT indicate when features actually deploy.
+    Individual feature GA dates are the source of truth.
+    """
+    if not wave_name:
+        return None
+    
+    wave_key = wave_name.lower().strip()
+    for key, dates in RELEASE_WAVES.items():
+        if wave_key in key.lower():
+            return pd.to_datetime(dates["end"])
+    return None
 
 # ────────────────────────────────────────────────
 # DATA FETCH & PARSE
@@ -101,6 +138,17 @@ def fetch_release_plans():
             
             if pd.notna(preview) and pd.notna(ga):
                 days_in_preview = (ga - preview).days
+            
+            # Determine if feature is in production
+            # ONLY reliable indicator: GA date has passed AND status is GA
+            # We do NOT assume wave deployment dates mean production
+            in_production = False
+            production_date = None
+            
+            if status == "Generally Available" and pd.notna(ga) and ga <= today:
+                # Feature has reached GA and the date has passed
+                in_production = True
+                production_date = ga
 
             rows.append({
                 "Product": clean(f.get("Product name")),
@@ -119,6 +167,8 @@ def fetch_release_plans():
                 "Last Updated": last_updated,
                 "Days to GA": days_to_ga,
                 "Days in Preview": days_in_preview,
+                "In Production": in_production,
+                "Production Date": production_date,
             })
 
         df = pd.DataFrame(rows)
@@ -134,8 +184,15 @@ def fetch_release_plans():
         )
         
         df = df.sort_values("Last Updated", ascending=False, na_position="last")
-        df["App"] = df["Product"].str.replace(" ", "+", regex=False)
-        df["Link"] = "https://experience.dynamics.com/releaseplans?app=" + df["App"] + "&planID=" + df["Release Plan ID"] + "&rp=all-plans"
+        
+        # Create Google search links for features
+        df["Search Query"] = df.apply(
+            lambda row: f"{row['Feature']} {row['Product']} microsoft dynamics".strip(), 
+            axis=1
+        )
+        df["Link"] = df["Search Query"].apply(
+            lambda q: f"https://www.google.com/search?q={quote_plus(q)}"
+        )
         
         return df
 
@@ -258,6 +315,14 @@ if df is None or df.empty:
 # ── Sidebar Filters ──────────────────────────────
 with st.sidebar:
     st.header("🔍 Filters")
+    
+    # Search at top
+    search = st.text_input("🔎 Search", placeholder="Keywords...", label_visibility="collapsed")
+    
+    if search:
+        st.caption(f"Searching for: {search}")
+    
+    st.divider()
 
     sel_product = st.multiselect(
         "Product",
@@ -282,9 +347,14 @@ with st.sidebar:
         options=sorted(df["Area"].dropna().unique()),
         default=[]
     )
+    
+    sel_production = st.multiselect(
+        "GA Status",
+        options=["Reached GA", "Not GA Yet"],
+        default=[]
+    )
 
     # Date range filter
-    st.subheader("Date Range")
     use_date_filter = st.checkbox("Filter by GA Date")
     
     if use_date_filter:
@@ -302,8 +372,6 @@ with st.sidebar:
                 key="end_date"
             )
 
-    search = st.text_input("🔎 Keyword Search", placeholder="Search features, business value, details...")
-
 # Apply filters
 filtered = df.copy()
 
@@ -318,6 +386,14 @@ if sel_wave:
 
 if sel_area:
     filtered = filtered[filtered["Area"].isin(sel_area)]
+
+if sel_production:
+    prod_map = {
+        "Reached GA": True,
+        "Not GA Yet": False
+    }
+    prod_values = [prod_map[p] for p in sel_production]
+    filtered = filtered[filtered["In Production"].isin(prod_values)]
 
 if use_date_filter:
     start = pd.Timestamp(start_date)
@@ -342,7 +418,7 @@ if search:
 # ── Key Metrics ──────────────────────────────────
 st.markdown(f"### 📊 Overview: {len(filtered):,} of {len(df):,} features")
 
-metric_cols = st.columns(5)
+metric_cols = st.columns(6)
 
 status_counts = filtered["Status"].value_counts()
 statuses = ["Planned", "Early Access", "Public Preview", "Generally Available"]
@@ -357,19 +433,30 @@ for i, (status, color) in enumerate(zip(statuses, colors)):
         f"{pct:.1f}%"
     )
 
+# Production status
+prod_count = len(filtered[filtered["In Production"] == True])
+prod_pct = (prod_count / len(filtered) * 100) if len(filtered) > 0 else 0
+metric_cols[4].metric(
+    "🟢 GA Status",
+    f"{prod_count:,}",
+    f"{prod_pct:.1f}%"
+)
+
 # Upcoming releases
 upcoming_30 = len(filtered[
     (filtered["Days to GA"].notna()) & 
     (filtered["Days to GA"] >= 0) & 
     (filtered["Days to GA"] <= 30)
 ])
-metric_cols[4].metric("🎯 Next 30 Days", upcoming_30)
+metric_cols[5].metric("🎯 Next 30 Days", upcoming_30)
 
 st.divider()
 
 # ── Main Tabs ────────────────────────────────────
-tab_overview, tab_waves, tab_products, tab_timeline, tab_table, tab_recent = st.tabs([
+tab_overview, tab_ga_status, tab_release_info, tab_waves, tab_products, tab_timeline, tab_table, tab_recent = st.tabs([
     "📈 Executive Overview",
+    "🟢 GA Status",
+    "📅 Release Info",
     "🌊 Release Wave Analysis", 
     "📦 Product Breakdown",
     "📅 Timeline View",
@@ -462,6 +549,313 @@ with tab_overview:
             )
     else:
         st.info("No releases scheduled in the next 90 days")
+
+# ── PRODUCTION STATUS ────────────────────────────
+with tab_ga_status:
+    st.subheader("🟢 General Availability Status")
+    
+    st.info("""
+    **"Reached GA"** = Status is "Generally Available" AND GA date has passed (per Microsoft's release plans).
+    
+    ⚠️ Actual availability depends on your environment, region, release channel, and admin settings. Always verify in your tenant.
+    """)
+    
+    prod_features = filtered[filtered["In Production"] == True].copy()
+    non_prod_features = filtered[filtered["In Production"] == False].copy()
+    
+    prod_cols = st.columns(4)
+    prod_cols[0].metric("🟢 Reached GA", len(prod_features))
+    prod_cols[1].metric("🟡 Not GA Yet", len(non_prod_features))
+    
+    if len(filtered) > 0:
+        prod_rate = (len(prod_features) / len(filtered) * 100)
+        prod_cols[2].metric("GA Rate", f"{prod_rate:.1f}%")
+    
+    # Calculate features with future GA dates
+    future_ga = filtered[
+        (filtered["In Production"] == False) & 
+        (filtered["GA"].notna()) & 
+        (filtered["Days to GA"].notna()) &
+        (filtered["Days to GA"] > 0)
+    ]
+    prod_cols[3].metric("Scheduled GA", len(future_ga))
+    
+    st.divider()
+    
+    # GA status by product
+    st.subheader("GA Status by Product")
+    
+    prod_by_product = filtered.groupby(["Product", "In Production"]).size().reset_index(name="Count")
+    prod_by_product["In Production"] = prod_by_product["In Production"].map({
+        True: "Reached GA",
+        False: "Not GA Yet"
+    })
+    
+    if not prod_by_product.empty:
+        fig_prod = px.bar(
+            prod_by_product,
+            x="Product",
+            y="Count",
+            color="In Production",
+            title="GA Status by Product",
+            height=500,
+            color_discrete_map={
+                "Reached GA": "#2ca02c",
+                "Not GA Yet": "#ff7f0e"
+            },
+            barmode="stack"
+        )
+        fig_prod.update_traces(textposition="inside", texttemplate='%{y}')
+        st.plotly_chart(fig_prod, use_container_width=True)
+    
+    st.divider()
+    
+    # GA timeline
+    st.subheader("GA Release Timeline")
+    
+    ga_timeline = prod_features.copy()
+    if not ga_timeline.empty and "Production Date" in ga_timeline.columns:
+        ga_timeline["Month"] = ga_timeline["Production Date"].dt.to_period("M").astype(str)
+        monthly_ga = ga_timeline.groupby(["Month", "Product"]).size().reset_index(name="Count")
+        
+        fig_ga_timeline = px.bar(
+            monthly_ga,
+            x="Month",
+            y="Count",
+            color="Product",
+            title="Features Reaching GA by Month",
+            height=400
+        )
+        st.plotly_chart(fig_ga_timeline, use_container_width=True)
+    else:
+        st.info("No GA timeline data available")
+    
+    st.divider()
+    
+    # Detailed GA features list
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🟢 Reached GA")
+        if not prod_features.empty:
+            st.markdown(f"**{len(prod_features)} features with GA status**")
+            
+            prod_display = prod_features[[
+                "Product", "Feature", "Status", "GA", "GA Wave", "Link"
+            ]].copy()
+            
+            st.dataframe(
+                prod_display,
+                column_config={
+                    "Link": st.column_config.LinkColumn(
+                        "Search",
+                        display_text="🔍 Google",
+                        validate="^https://",
+                    ),
+                    "GA": st.column_config.DateColumn(
+                        "GA Date",
+                        format="YYYY-MM-DD"
+                    ),
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+            
+            # Download GA list
+            st.download_button(
+                "📥 Download GA Features",
+                prod_features.to_csv(index=False),
+                file_name=f"ga_features_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.info("No features have reached GA")
+    
+    with col2:
+        st.subheader("🟡 Not GA Yet")
+        if not non_prod_features.empty:
+            st.markdown(f"**{len(non_prod_features)} features pending GA**")
+            
+            non_prod_display = non_prod_features[[
+                "Product", "Feature", "Status", "GA", "GA Wave", "Link"
+            ]].copy()
+            
+            st.dataframe(
+                non_prod_display,
+                column_config={
+                    "Link": st.column_config.LinkColumn(
+                        "Search",
+                        display_text="🔍 Google",
+                        validate="^https://",
+                    ),
+                    "GA": st.column_config.DateColumn(
+                        "Target GA",
+                        format="YYYY-MM-DD"
+                    ),
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+            
+            # Download pending list
+            st.download_button(
+                "📥 Download Pre-GA Features",
+                non_prod_features.to_csv(index=False),
+                file_name=f"pre_ga_features_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.info("All features have reached GA")
+    
+    st.divider()
+    
+    # Wave-based GA analysis
+    st.subheader("GA Status by Release Wave")
+    
+    wave_prod = filtered.groupby(["Release Wave", "In Production"]).size().reset_index(name="Count")
+    wave_prod["In Production"] = wave_prod["In Production"].map({
+        True: "Reached GA",
+        False: "Not GA Yet"
+    })
+    
+    if not wave_prod.empty:
+        # Remove TBD waves
+        wave_prod = wave_prod[wave_prod["Release Wave"] != "TBD"]
+        
+        fig_wave_prod = px.bar(
+            wave_prod,
+            x="Release Wave",
+            y="Count",
+            color="In Production",
+            title="GA Achievement by Release Wave",
+            height=400,
+            color_discrete_map={
+                "Reached GA": "#2ca02c",
+                "Not GA Yet": "#ff7f0e"
+            },
+            barmode="group"
+        )
+        st.plotly_chart(fig_wave_prod, use_container_width=True)
+        
+        # Show wave target dates (for reference only)
+        st.markdown("### Release Wave Periods")
+        st.caption("Wave periods indicate when features typically release. Individual feature dates may vary.")
+        wave_info = []
+        for wave_name, dates in RELEASE_WAVES.items():
+            wave_info.append({
+                "Release Wave": wave_name.title(),
+                "Feature Period Start": dates["start"],
+                "Feature Period End": dates["end"],
+                "Notes": "Features releasing during this period"
+            })
+        
+        wave_info_df = pd.DataFrame(wave_info)
+        st.dataframe(
+            wave_info_df,
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No wave GA data available")
+
+# ── RELEASE INFORMATION ──────────────────────────
+with tab_release_info:
+    st.subheader("📅 Microsoft Release Schedule")
+    
+    # Release Waves
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        **Wave 1 (Spring)**
+        - Plans: Late January
+        - Early Access: Early February
+        - GA: April 1
+        - Features: April - September
+        """)
+    
+    with col2:
+        st.markdown("""
+        **Wave 2 (Fall)**
+        - Plans: Mid-July
+        - Early Access: Late July/August
+        - GA: October 1
+        - Features: October - March
+        """)
+    
+    st.caption("Dates vary by app, feature, and region")
+    st.divider()
+    
+    # Release Channels
+    st.markdown("### Release Channels (2026+)")
+    
+    channel_cols = st.columns(2)
+    
+    with channel_cols[0]:
+        st.markdown("""
+        **Monthly**
+        - Features available as released
+        - For latest features immediately
+        """)
+    
+    with channel_cols[1]:
+        st.markdown("""
+        **Semi-Annual**
+        - Features during April/October
+        - For predictable timing
+        """)
+    
+    st.info("Both get weekly deployments. Only feature visibility differs. Cannot skip updates.")
+    st.divider()
+    
+    # Feature Types
+    st.markdown("### Feature Availability")
+    
+    st.markdown("""
+    | Type | Enabled By | Action |
+    |------|-----------|--------|
+    | Users, automatically | Microsoft | None |
+    | Admins, automatically | Microsoft | None |
+    | Users by admins | Admin | Required |
+    """)
+    
+    st.divider()
+    
+    # GA Clarification
+    st.markdown("### What GA Means")
+    
+    ga_cols = st.columns(2)
+    
+    with ga_cols[0]:
+        st.markdown("""
+        **NOT:**
+        - ❌ Instant availability
+        - ❌ Auto-enabled everywhere
+        - ❌ Same date globally
+        """)
+    
+    with ga_cols[1]:
+        st.markdown("""
+        **YES:**
+        - ✅ Production-ready
+        - ✅ Regional rollout starts
+        - ✅ May need admin setup
+        """)
+    
+    st.divider()
+    
+    # Resources
+    st.markdown("### Resources")
+    st.markdown("""
+    - [Release Plans](https://learn.microsoft.com/en-us/dynamics365/release-plans/)
+    - [Release Planner](https://releaseplans.microsoft.com/)
+    - [Release Schedule](https://learn.microsoft.com/en-us/dynamics365/get-started/release-schedule)
+    - [Early Access](https://learn.microsoft.com/en-us/power-platform/admin/opt-in-early-access-updates)
+    """)
 
 # ── RELEASE WAVE ANALYSIS ────────────────────────
 with tab_waves:
@@ -724,18 +1118,28 @@ with tab_table:
     st.subheader("Detailed Features List")
     
     display_cols = [
-        "Product", "Feature", "Status", "Public Preview", "GA",
-        "Release Wave", "Area", "Enabled For", "Days to GA", "Last Updated", "Link"
+        "Product", "Feature", "Status", "In Production", "Production Date",
+        "Public Preview", "GA", "Release Wave", "Area", "Enabled For", 
+        "Days to GA", "Last Updated", "Link"
     ]
 
     event = st.dataframe(
         filtered[display_cols],
         column_config={
             "Link": st.column_config.LinkColumn(
-                "Details",
-                display_text="View →",
-                help="Link to release plan details",
+                "Search",
+                display_text="🔍 Google",
+                help="Search for this feature on Google",
                 validate="^https://",
+            ),
+            "In Production": st.column_config.CheckboxColumn(
+                "GA?",
+                help="Feature has reached General Availability status",
+            ),
+            "Production Date": st.column_config.DateColumn(
+                "GA Date",
+                format="YYYY-MM-DD",
+                help="Date feature reached GA"
             ),
             "Days to GA": st.column_config.NumberColumn(
                 "Days to GA",
@@ -787,11 +1191,17 @@ with tab_table:
         st.divider()
         st.subheader(f"📌 {row['Feature']}")
         
-        detail_cols = st.columns(4)
+        detail_cols = st.columns(5)
         detail_cols[0].metric("Product", row["Product"])
         detail_cols[1].metric("Status", row["Status"])
         detail_cols[2].metric("Release Wave", row["Release Wave"])
         detail_cols[3].metric("Area", row["Area"])
+        
+        # GA status indicator
+        if row["In Production"]:
+            detail_cols[4].metric("🟢 Status", "GA")
+        else:
+            detail_cols[4].metric("🟡 Status", row["Status"])
         
         if row["Business Value"]:
             st.markdown("**💼 Business Value:**")
@@ -804,19 +1214,21 @@ with tab_table:
         if row["Enabled For"]:
             st.markdown(f"**👥 Enabled For:** {row['Enabled For']}")
         
-        date_cols = st.columns(3)
+        date_cols = st.columns(4)
         if pd.notna(row["Public Preview"]):
             date_cols[0].metric("Preview Date", row["Public Preview"].strftime("%Y-%m-%d"))
         if pd.notna(row["GA"]):
             date_cols[1].metric("GA Date", row["GA"].strftime("%Y-%m-%d"))
+        if row["In Production"] and pd.notna(row.get("Production Date")):
+            date_cols[2].metric("Reached GA On", row["Production Date"].strftime("%Y-%m-%d"))
         if pd.notna(row["Days to GA"]):
             days = int(row["Days to GA"])
             if days > 0:
-                date_cols[2].metric("Days Until GA", days)
+                date_cols[3].metric("Days Until GA", days)
             elif days < 0:
-                date_cols[2].metric("Days Since GA", abs(days))
+                date_cols[3].metric("Days Since GA", abs(days))
         
-        st.link_button("🔗 View on Microsoft Release Planner", row["Link"], use_container_width=True)
+        st.link_button("🔍 Search on Google", row["Link"], use_container_width=True)
 
 # ── RECENT UPDATES ───────────────────────────────
 with tab_recent:
@@ -861,9 +1273,9 @@ with tab_recent:
             recent[display_cols],
             column_config={
                 "Link": st.column_config.LinkColumn(
-                    "Details",
-                    display_text="View →",
-                    help="Link to release plan details",
+                    "Search",
+                    display_text="🔍 Google",
+                    help="Search for this feature on Google",
                     validate="^https://",
                 ),
                 "Last Updated": st.column_config.DateColumn(
