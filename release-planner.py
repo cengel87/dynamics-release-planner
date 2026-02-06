@@ -26,6 +26,7 @@ from plotly.subplots import make_subplots
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus
+import urllib.parse
 
 # ────────────────────────────────────────────────
 # CONFIG
@@ -193,14 +194,21 @@ def fetch_release_plans():
         # Sort by last updated
         df = df.sort_values("Last Gitcommit date", ascending=False, na_position="last")
         
-        # Create Google search links
-        df["Search Query"] = df.apply(
-            lambda row: f"{row['Feature name']} {row['Product name']} microsoft dynamics".strip(), 
-            axis=1
-        )
-        df["Search Link"] = df["Search Query"].apply(
-            lambda q: f"https://www.google.com/search?q={quote_plus(q)}"
-        )
+        # Create release planner search links
+        def create_search_link(row):
+            product = row.get("Product name", "")
+            feature = row.get("Feature name", "")
+            
+            # Simplify product name for app parameter
+            # Remove "Dynamics 365" and "Microsoft" prefixes
+            app_name = product.replace("Dynamics 365 ", "").replace("Microsoft ", "").strip()
+            
+            # Build URL
+            base_url = "https://releaseplans.microsoft.com/en-us/"
+            params = f"?app={urllib.parse.quote(app_name)}&q={urllib.parse.quote(feature)}"
+            return base_url + params
+        
+        df["Search Link"] = df.apply(create_search_link, axis=1)
         
         return df
 
@@ -289,7 +297,13 @@ with st.sidebar:
     sel_product = st.multiselect(
         "Product",
         options=sorted(df["Product name"].dropna().unique()),
-        default=[]
+        default=[
+            "Dynamics 365 Field Service",
+            "Power Apps",
+            "Power Automate",
+            "Microsoft Power Platform governance and administration",
+            "Microsoft Dataverse"
+        ]
     )
 
     # Status filter (calculated from dates)
@@ -405,8 +419,9 @@ metric_cols[5].metric("📅 Dated", with_dates)
 st.divider()
 
 # ── Main Tabs ────────────────────────────────────
-tab_overview, tab_status, tab_table, tab_recent = st.tabs([
+tab_overview, tab_enablement, tab_status, tab_table, tab_recent = st.tabs([
     "📈 Overview",
+    "⚙️ Enablement",
     "📊 By Status",
     "📋 All Features",
     "🆕 Recent Updates"
@@ -488,6 +503,263 @@ with tab_overview:
             )
     else:
         st.info("No releases scheduled in the next 90 days")
+
+# ── ENABLEMENT ANALYSIS ──────────────────────────
+with tab_enablement:
+    st.subheader("⚙️ Feature Enablement Analysis")
+    
+    st.info("""
+    **Critical for planning:** Features enabled "automatically" deploy without admin action and may impact users immediately.
+    Features requiring admin enablement give you control over rollout timing.
+    """)
+    
+    # Enablement breakdown
+    enablement_counts = filtered["Enabled for"].fillna("Not specified").value_counts()
+    
+    enable_cols = st.columns(3)
+    
+    # Auto-enabled features (HIGH PRIORITY)
+    auto_users = len(filtered[filtered["Enabled for"] == "Users, automatically"])
+    auto_admins = len(filtered[filtered["Enabled for"] == "Admins, makers, marketers, or analysts, automatically"])
+    total_auto = auto_users + auto_admins
+    
+    enable_cols[0].metric(
+        "🔴 Auto-Enabled",
+        total_auto,
+        "Deploy immediately",
+        delta_color="off"
+    )
+    
+    # Admin-controlled features
+    admin_controlled = len(filtered[filtered["Enabled for"] == "Users by admins, makers, or analysts"])
+    
+    enable_cols[1].metric(
+        "🟡 Admin-Controlled",
+        admin_controlled,
+        "You control timing",
+        delta_color="off"
+    )
+    
+    # Not specified
+    not_specified = len(filtered[filtered["Enabled for"].isna()])
+    
+    enable_cols[2].metric(
+        "⚪ Not Specified",
+        not_specified,
+        "Check docs",
+        delta_color="off"
+    )
+    
+    st.divider()
+    
+    # Enablement by Product
+    st.subheader("Enablement by Product")
+    
+    enablement_by_product = filtered.groupby(["Product name", "Enabled for"]).size().reset_index(name="Count")
+    enablement_by_product["Enabled for"] = enablement_by_product["Enabled for"].fillna("Not specified")
+    
+    # Simplify labels for chart
+    enablement_by_product["Enablement Type"] = enablement_by_product["Enabled for"].apply(
+        lambda x: "Auto-Enabled" if "automatically" in str(x).lower() 
+        else ("Admin-Controlled" if "by admins" in str(x).lower() 
+        else "Not Specified")
+    )
+    
+    if not enablement_by_product.empty:
+        fig_enable_product = px.bar(
+            enablement_by_product,
+            x="Product name",
+            y="Count",
+            color="Enablement Type",
+            title="Feature Enablement by Product",
+            height=500,
+            color_discrete_map={
+                "Auto-Enabled": "#dc3545",
+                "Admin-Controlled": "#ffc107",
+                "Not Specified": "#6c757d"
+            },
+            barmode="stack"
+        )
+        st.plotly_chart(fig_enable_product, use_container_width=True)
+    
+    st.divider()
+    
+    # Critical: Auto-enabled features
+    st.subheader("🔴 Auto-Enabled Features (Requires Immediate Attention)")
+    
+    auto_features = filtered[
+        filtered["Enabled for"].str.contains("automatically", na=False, case=False)
+    ].copy()
+    
+    if not auto_features.empty:
+        st.warning(f"""
+        **{len(auto_features)} features will auto-enable without admin action!**
+        
+        These features deploy automatically when their GA date passes, regardless of your release channel.
+        Review and test these BEFORE their GA date to avoid surprises.
+        """)
+        
+        # Show upcoming auto-enabled features
+        upcoming_auto = auto_features[
+            (auto_features["GA date"].notna()) & 
+            (auto_features["GA date"] >= pd.Timestamp.now().normalize())
+        ].sort_values("GA date")
+        
+        if not upcoming_auto.empty:
+            st.markdown(f"### 🚨 {len(upcoming_auto)} Auto-Enabled Features Coming Soon")
+            
+            # Group by month
+            upcoming_auto["Month"] = upcoming_auto["GA date"].dt.strftime("%Y-%m")
+            auto_by_month = upcoming_auto.groupby("Month").size().reset_index(name="Count")
+            
+            fig_auto_timeline = px.bar(
+                auto_by_month,
+                x="Month",
+                y="Count",
+                title="Auto-Enabled Features by Month",
+                height=300,
+                color_discrete_sequence=["#dc3545"]
+            )
+            st.plotly_chart(fig_auto_timeline, use_container_width=True)
+            
+            # Detailed list
+            st.dataframe(
+                upcoming_auto[[
+                    "Product name", "Feature name", "Enabled for", 
+                    "GA date", "Days to GA", "Status", "Release Wave", "Search Link"
+                ]],
+                column_config={
+                    "GA date": st.column_config.DateColumn("GA Date", format="YYYY-MM-DD"),
+                    "Days to GA": st.column_config.NumberColumn("Days Until GA", format="%d"),
+                    "Search Link": st.column_config.LinkColumn("Search", display_text="🔍"),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            st.download_button(
+                "📥 Download Auto-Enabled Features",
+                upcoming_auto.to_csv(index=False),
+                file_name=f"auto_enabled_features_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.success("No upcoming auto-enabled features in the selected filters")
+        
+        # Already auto-enabled
+        already_auto = auto_features[
+            (auto_features["GA date"].notna()) & 
+            (auto_features["GA date"] < pd.Timestamp.now().normalize())
+        ]
+        
+        if not already_auto.empty:
+            with st.expander(f"📋 {len(already_auto)} Auto-Enabled Features Already Deployed"):
+                st.dataframe(
+                    already_auto[[
+                        "Product name", "Feature name", "Enabled for", 
+                        "GA date", "Status", "Release Wave"
+                    ]],
+                    column_config={
+                        "GA date": st.column_config.DateColumn("GA Date", format="YYYY-MM-DD"),
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+    else:
+        st.success("No auto-enabled features in current filters")
+    
+    st.divider()
+    
+    # Admin-controlled features
+    st.subheader("🟡 Admin-Controlled Features (You Control Timing)")
+    
+    admin_features = filtered[
+        filtered["Enabled for"].str.contains("by admins", na=False, case=False)
+    ].copy()
+    
+    if not admin_features.empty:
+        st.info(f"""
+        **{len(admin_features)} features require admin enablement.**
+        
+        These features deploy to your environment but remain hidden until you explicitly enable them.
+        You control when users see these features.
+        """)
+        
+        # Show available admin features
+        available_admin = admin_features[
+            admin_features["Status"] == "Generally Available"
+        ]
+        
+        if not available_admin.empty:
+            st.markdown(f"### ✅ {len(available_admin)} Available for Enablement")
+            
+            st.dataframe(
+                available_admin[[
+                    "Product name", "Feature name", "Enabled for", 
+                    "GA date", "Status", "Release Wave", "Search Link"
+                ]],
+                column_config={
+                    "GA date": st.column_config.DateColumn("GA Date", format="YYYY-MM-DD"),
+                    "Search Link": st.column_config.LinkColumn("Search", display_text="🔍"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=300
+            )
+        
+        # Coming soon
+        coming_admin = admin_features[
+            (admin_features["Status"] != "Generally Available") &
+            (admin_features["GA date"].notna())
+        ].sort_values("GA date")
+        
+        if not coming_admin.empty:
+            with st.expander(f"🔜 {len(coming_admin)} Admin Features Coming Soon"):
+                st.dataframe(
+                    coming_admin[[
+                        "Product name", "Feature name", "Enabled for", 
+                        "GA date", "Days to GA", "Status", "Release Wave"
+                    ]],
+                    column_config={
+                        "GA date": st.column_config.DateColumn("GA Date", format="YYYY-MM-DD"),
+                        "Days to GA": st.column_config.NumberColumn("Days Until GA", format="%d"),
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+    else:
+        st.info("No admin-controlled features in current filters")
+    
+    st.divider()
+    
+    # Enablement by Status
+    st.subheader("Enablement Type by Status")
+    
+    enablement_status = filtered.groupby(["Status", "Enabled for"]).size().reset_index(name="Count")
+    enablement_status["Enabled for"] = enablement_status["Enabled for"].fillna("Not specified")
+    enablement_status["Enablement Type"] = enablement_status["Enabled for"].apply(
+        lambda x: "Auto-Enabled" if "automatically" in str(x).lower() 
+        else ("Admin-Controlled" if "by admins" in str(x).lower() 
+        else "Not Specified")
+    )
+    
+    if not enablement_status.empty:
+        fig_enable_status = px.bar(
+            enablement_status,
+            x="Status",
+            y="Count",
+            color="Enablement Type",
+            title="Enablement Type by Feature Status",
+            height=400,
+            color_discrete_map={
+                "Auto-Enabled": "#dc3545",
+                "Admin-Controlled": "#ffc107",
+                "Not Specified": "#6c757d"
+            },
+            barmode="group"
+        )
+        st.plotly_chart(fig_enable_status, use_container_width=True)
 
 # ── BY STATUS ────────────────────────────────────
 with tab_status:
