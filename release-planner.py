@@ -1,11 +1,14 @@
 """
-D365 & Power Platform Release Tracker — Team Edition
+D365 & Power Platform Release Tracker — Streamlit Sharing Edition
 =====================================================
-Enhanced collaborative release tracking with:
+Simplified version - authentication handled by Streamlit sharing invites.
+All invited users have full access to all features.
+
+Features:
 - Supabase persistence (watchlists, notes, saved views)
 - Change detection & history
-- Team authentication
 - Enablement analysis
+- No login required - access controlled by Streamlit sharing
 
 Deploy: Streamlit Community Cloud + Supabase (free tier)
 """
@@ -13,7 +16,6 @@ Deploy: Streamlit Community Cloud + Supabase (free tier)
 import json
 import re
 import hashlib
-import hmac
 import time
 import requests
 import streamlit as st
@@ -114,50 +116,33 @@ def db_available() -> bool:
     return get_supabase() is not None
 
 
-# ── Auth helpers ──────────────────────────────────
-
-def hash_password(password: str) -> str:
-    """Simple SHA-256 hash for passwords. Good enough for internal tool."""
-    return hashlib.sha256(password.encode()).hexdigest()
-
-
-def authenticate_user(username: str, password: str) -> dict | None:
-    """Check credentials against DB. Returns user dict or None."""
+def get_or_create_user(email: str) -> dict:
+    """
+    Get or create a user based on Streamlit user email.
+    This replaces the authentication system.
+    """
     sb = get_supabase()
     if not sb:
-        return None
+        return {"id": "demo", "email": email, "display_name": email.split('@')[0]}
+    
     try:
-        pwd_hash = hash_password(password)
-        result = sb.table("users").select("*").eq(
-            "username", username
-        ).eq("password_hash", pwd_hash).execute()
+        # Try to find existing user
+        result = sb.table("users").select("*").eq("email", email).execute()
+        
         if result.data:
-            user = result.data[0]
-            # Update last login
-            sb.table("users").update(
-                {"last_login": datetime.utcnow().isoformat()}
-            ).eq("id", user["id"]).execute()
-            return user
-        return None
-    except Exception:
-        return None
-
-
-def register_user(username: str, display_name: str, password: str) -> bool:
-    """Register a new team member."""
-    sb = get_supabase()
-    if not sb:
-        return False
-    try:
-        sb.table("users").insert({
-            "username": username,
+            return result.data[0]
+        
+        # Create new user
+        display_name = email.split('@')[0].replace('.', ' ').title()
+        new_user = sb.table("users").insert({
+            "email": email,
             "display_name": display_name,
-            "password_hash": hash_password(password),
-            "role": "member",
         }).execute()
-        return True
-    except Exception:
-        return False
+        
+        return new_user.data[0] if new_user.data else {"id": "demo", "email": email, "display_name": display_name}
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return {"id": "demo", "email": email, "display_name": email.split('@')[0]}
 
 
 # ── Watchlist helpers ─────────────────────────────
@@ -165,7 +150,7 @@ def register_user(username: str, display_name: str, password: str) -> bool:
 def get_user_watchlist(user_id: str) -> list[str]:
     """Get list of release_plan_ids on user's watchlist."""
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return []
     try:
         result = sb.table("watchlist").select("release_plan_id").eq(
@@ -179,7 +164,7 @@ def get_user_watchlist(user_id: str) -> list[str]:
 def get_watchlist_details(user_id: str) -> list[dict]:
     """Get full watchlist with feature details."""
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return []
     try:
         result = sb.table("watchlist").select("*").eq(
@@ -193,7 +178,7 @@ def get_watchlist_details(user_id: str) -> list[dict]:
 def add_to_watchlist(user_id: str, release_plan_id: str,
                      feature_name: str, product_name: str) -> bool:
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return False
     try:
         sb.table("watchlist").upsert({
@@ -209,7 +194,7 @@ def add_to_watchlist(user_id: str, release_plan_id: str,
 
 def remove_from_watchlist(user_id: str, release_plan_id: str) -> bool:
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return False
     try:
         sb.table("watchlist").delete().eq(
@@ -229,7 +214,7 @@ def get_notes(release_plan_id: str) -> list[dict]:
         return []
     try:
         result = sb.table("notes").select(
-            "*, users(display_name, username)"
+            "*, users(display_name, email)"
         ).eq("release_plan_id", release_plan_id).order(
             "created_at", desc=True
         ).execute()
@@ -240,7 +225,7 @@ def get_notes(release_plan_id: str) -> list[dict]:
 
 def add_note(user_id: str, release_plan_id: str, content: str) -> bool:
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return False
     try:
         sb.table("notes").insert({
@@ -282,7 +267,7 @@ def delete_note(note_id: str) -> bool:
 
 def get_saved_views(user_id: str) -> list[dict]:
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return []
     try:
         result = sb.table("saved_views").select("*").or_(
@@ -296,7 +281,7 @@ def get_saved_views(user_id: str) -> list[dict]:
 def save_view(user_id: str, name: str, description: str,
               config: dict, is_shared: bool = False) -> bool:
     sb = get_supabase()
-    if not sb:
+    if not sb or user_id == "demo":
         return False
     try:
         sb.table("saved_views").insert({
@@ -730,10 +715,6 @@ def refresh_with_change_detection():
 
 def init_session_state():
     defaults = {
-        "authenticated": False,
-        "user": None,
-        "user_id": None,
-        "show_login": True,
         "active_tab": "Overview",
     }
     for k, v in defaults.items():
@@ -742,66 +723,6 @@ def init_session_state():
 
 
 init_session_state()
-
-
-# ────────────────────────────────────────────────
-# AUTH UI
-# ────────────────────────────────────────────────
-
-def show_auth_ui():
-    """Show login/register forms. Returns True if authenticated."""
-    if not db_available():
-        # No DB configured — run in demo mode
-        st.session_state.authenticated = True
-        st.session_state.user = {"display_name": "Demo User", "id": "demo", "role": "admin"}
-        st.session_state.user_id = "demo"
-        return True
-
-    if st.session_state.authenticated:
-        return True
-
-    st.markdown("## 🔐 Team Login")
-    st.caption("Internal tool — team members only")
-
-    login_tab, register_tab = st.tabs(["Login", "Register"])
-
-    with login_tab:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login", use_container_width=True)
-
-            if submitted and username and password:
-                user = authenticate_user(username, password)
-                if user:
-                    st.session_state.authenticated = True
-                    st.session_state.user = user
-                    st.session_state.user_id = user["id"]
-                    st.rerun()
-                else:
-                    st.error("Invalid credentials")
-
-    with register_tab:
-        with st.form("register_form"):
-            new_user = st.text_input("Username", key="reg_user")
-            new_name = st.text_input("Display Name", key="reg_name")
-            new_pass = st.text_input("Password", type="password", key="reg_pass")
-            new_pass2 = st.text_input("Confirm Password", type="password", key="reg_pass2")
-            reg_submitted = st.form_submit_button("Register", use_container_width=True)
-
-            if reg_submitted:
-                if not all([new_user, new_name, new_pass, new_pass2]):
-                    st.error("All fields required")
-                elif new_pass != new_pass2:
-                    st.error("Passwords don't match")
-                elif len(new_pass) < 6:
-                    st.error("Password must be at least 6 characters")
-                elif register_user(new_user, new_name, new_pass):
-                    st.success("Registered! Please login.")
-                else:
-                    st.error("Username may already exist")
-
-    return False
 
 
 # ────────────────────────────────────────────────
@@ -873,7 +794,7 @@ def render_feature_card(row: pd.Series, user_id: str = None,
         enabled = row.get("Enabled for", "")
         cols[3].markdown(f"**Enabled:** {enabled if enabled else 'N/A'}")
 
-        # Dates row
+        # Dates row - FIXED: Added pd.notna() check
         date_cols = st.columns(4)
         if pd.notna(row.get("Early access date")):
             date_cols[0].metric("Early Access", row["Early access date"].strftime("%Y-%m-%d"))
@@ -881,6 +802,8 @@ def render_feature_card(row: pd.Series, user_id: str = None,
             date_cols[1].metric("Preview", row["Public preview date"].strftime("%Y-%m-%d"))
         if pd.notna(row.get("GA date")):
             date_cols[2].metric("GA Date", row["GA date"].strftime("%Y-%m-%d"))
+        
+        # FIXED: Check for both None and NaN before converting to int
         if row.get("Days to GA") is not None and pd.notna(row["Days to GA"]):
             days = int(row["Days to GA"])
             if days > 0:
@@ -905,17 +828,17 @@ def render_feature_card(row: pd.Series, user_id: str = None,
         # Action buttons
         btn_cols = st.columns([1, 1, 2])
 
-        if show_watchlist and user_id and user_id != "demo":
+        if show_watchlist and user_id and user_id != "demo" and db_available():
             if watched:
                 if btn_cols[0].button("⭐ Remove from Watchlist",
                                       key=f"unwatch_{rpid}",
-                                      use_container_width=True):
+                                      width='stretch'):
                     remove_from_watchlist(user_id, rpid)
                     st.rerun()
             else:
                 if btn_cols[0].button("☆ Add to Watchlist",
                                       key=f"watch_{rpid}",
-                                      use_container_width=True):
+                                      width='stretch'):
                     add_to_watchlist(
                         user_id, rpid,
                         row["Feature name"], row["Product name"]
@@ -925,7 +848,7 @@ def render_feature_card(row: pd.Series, user_id: str = None,
         link = row.get("Search Link", "")
         if link:
             btn_cols[1].link_button("🔍 View on Microsoft", link,
-                                    use_container_width=True)
+                                    width='stretch')
 
         # Notes section
         if user_id and user_id != "demo" and db_available():
@@ -984,16 +907,25 @@ def render_feature_card(row: pd.Series, user_id: str = None,
 # ────────────────────────────────────────────────
 
 def main():
+    # Get current user from Streamlit context
+    # In Streamlit Cloud, user email is available via experimental_user
+    user_email = "demo@example.com"  # Default for local
+    
+    try:
+        # Try to get Streamlit user info
+        user_info = st.experimental_user
+        if user_info and hasattr(user_info, 'email') and user_info.email:
+            user_email = user_info.email
+    except:
+        pass
+    
+    # Get or create user in database
+    user = get_or_create_user(user_email)
+    user_id = user.get("id", "demo")
+    
     # Header
     st.title("🚀 D365 & Power Platform Release Tracker")
-
-    # Auth check
-    if not show_auth_ui():
-        return
-
-    user = st.session_state.user
-    user_id = st.session_state.user_id
-
+    
     # User bar
     header_cols = st.columns([4, 1, 1])
     header_cols[0].caption(
@@ -1001,17 +933,12 @@ def main():
         f"Last Refreshed: {datetime.utcnow():%Y-%m-%d %H:%M UTC}"
     )
     if db_available():
-        if header_cols[1].button("🔄 Refresh & Detect Changes", use_container_width=True):
+        if header_cols[1].button("🔄 Refresh & Detect Changes", width='stretch'):
             fetch_release_plans_api.clear()
             get_data.clear()
             with st.spinner("Refreshing data and detecting changes…"):
                 refresh_with_change_detection()
             st.rerun()
-    if header_cols[2].button("🚪 Logout", use_container_width=True):
-        st.session_state.authenticated = False
-        st.session_state.user = None
-        st.session_state.user_id = None
-        st.rerun()
 
     # Load data
     df = get_data()
@@ -1212,7 +1139,7 @@ def main():
                     title="Upcoming Releases by Month",
                     height=400, color_discrete_map=STATUS_COLORS, barmode="stack"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             else:
                 st.info("No upcoming releases with GA dates in current filters")
 
@@ -1224,7 +1151,7 @@ def main():
                 title="Status Distribution", height=400,
                 color="Status", color_discrete_map=STATUS_COLORS
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width='stretch')
 
         st.divider()
 
@@ -1251,13 +1178,13 @@ def main():
                 height=400, text="Count"
             )
             fig_prod.update_traces(textposition="outside")
-            st.plotly_chart(fig_prod, use_container_width=True)
+            st.plotly_chart(fig_prod, width='stretch')
 
             with st.expander(f"📋 View {len(upcoming_90)} Upcoming Features"):
                 st.dataframe(
                     upcoming_90[["Product name", "Feature name", "GA date",
                                 "Days to GA", "Status", "Release Wave"]],
-                    use_container_width=True, hide_index=True
+                    width='stretch', hide_index=True
                 )
         else:
             st.info("No GA releases in the next 90 days for current filters")
@@ -1278,7 +1205,7 @@ def main():
                 height=500, title="Feature Status by Product"
             )
             fig_ps.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_ps, use_container_width=True)
+            st.plotly_chart(fig_ps, width='stretch')
 
     # ══════════════════════════════════════════════
     # TAB: ALL FEATURES
@@ -1315,7 +1242,7 @@ def main():
                     "Last Gitcommit date": st.column_config.DateColumn("Updated", format="YYYY-MM-DD"),
                     "Search Link": st.column_config.LinkColumn("🔍", display_text="🔍"),
                 },
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
                 on_select="rerun", selection_mode="single-row",
                 height=600
             )
@@ -1398,7 +1325,7 @@ def main():
                     fig = px.bar(monthly, x="Month", y="Count",
                                 title="Auto-Enabled Features by Month",
                                 color_discrete_sequence=["#dc3545"])
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
                     for _, row in upcoming_auto.iterrows():
                         render_feature_card(row, user_id, watchlist_ids)
@@ -1452,7 +1379,7 @@ def main():
                             "GA date": st.column_config.DateColumn("GA", format="YYYY-MM-DD"),
                             "Search Link": st.column_config.LinkColumn("🔍", display_text="🔍"),
                         },
-                        use_container_width=True, hide_index=True, height=400
+                        width='stretch', hide_index=True, height=400
                     )
             else:
                 st.info("No features in this category")
@@ -1472,7 +1399,7 @@ def main():
                 title="Features by Enablement Type",
                 color_discrete_sequence=["#dc3545", "#fd7e14", "#ffc107", "#6c757d"]
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     # ══════════════════════════════════════════════
     # TAB: WATCHLIST
@@ -1483,7 +1410,7 @@ def main():
         if user_id == "demo" or not db_available():
             st.info(
                 "Watchlist requires database connection. "
-                "Configure Supabase in .streamlit/secrets.toml to enable."
+                "Configure Supabase in App Settings > Secrets to enable."
             )
         else:
             watchlist_details = get_watchlist_details(user_id)
@@ -1584,7 +1511,7 @@ def main():
                         "old_value": "Old Value",
                         "new_value": "New Value",
                     }),
-                    use_container_width=True, hide_index=True, height=500
+                    width='stretch', hide_index=True, height=500
                 )
 
                 st.download_button(
@@ -1623,7 +1550,7 @@ def main():
                                 "GA date": st.column_config.DateColumn("GA", format="YYYY-MM-DD"),
                                 "Public preview date": st.column_config.DateColumn("Preview", format="YYYY-MM-DD"),
                             },
-                            use_container_width=True, hide_index=True, height=300
+                            width='stretch', hide_index=True, height=300
                         )
 
         st.divider()
@@ -1647,7 +1574,7 @@ def main():
     st.caption(
         f"Data: [Microsoft Release Plans](https://releaseplans.microsoft.com) | "
         f"DB: {db_status} | "
-        f"Status derived from dates"
+        f"Access controlled by Streamlit sharing"
     )
 
 
